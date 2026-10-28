@@ -1,14 +1,30 @@
 from dataclasses import dataclass, field
 from collections import deque
 import json
+import logging
 from pathlib import Path
+import threading
 from typing import Callable
 import zmq
 from fire_n_forget.job import Job, satisfies, JobStatus
 from fire_n_forget.json_utils import get_completion, next_job_id, save_completion
 from fire_n_forget.resource import Cluster, CPUResource, GPUResource, RAMResources, DatasetResource
+from fire_n_forget.notify import notify
 
 PORT: int = 0xFAF  # 4015 for the meme
+logger = logging.getLogger(__name__)
+
+
+def notify_completion(job_id: int, command: str, stdout: str) -> None:
+    """Report completion without delaying the daemon's scheduler."""
+    def send() -> None:
+        try:
+            notify(f"Job {job_id} completed\nCommand: {command[:500]}\nOutput:\n{stdout[:1000]}")
+        except Exception as exc:
+            # HTTP errors can contain the bot token in their URL.
+            logger.error("Telegram notification failed (%s)", type(exc).__name__)
+
+    threading.Thread(target=send, daemon=True).start()
 
 
 def send_job(cluster: Cluster, cluster_id: int, job_id: int, job: Job) -> bool:
@@ -100,6 +116,7 @@ class Daemon:
             self.used_cluster.discard(assigned)
             self.free_cluster.add(assigned)
         self.dispatch()
+        notify_completion(job_id, job.command, stdout)
         return True
 
     def job_status(self, job_id: int) -> JobStatus:
