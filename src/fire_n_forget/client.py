@@ -4,6 +4,8 @@ import argparse
 import base64
 import json
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -12,6 +14,37 @@ import time
 import zmq
 from prometheus_client import start_http_server
 from fire_n_forget.metrics import WorkerMetrics
+
+
+def worker_cpus(cluster: dict) -> list[int]:
+    """Pick allowed logical CPUs, preferring different physical cores."""
+    allowed = os.sched_getaffinity(0)
+    count = cluster['cpu'][0]
+    if type(count) is not int or count < 1:
+        raise ValueError('Worker CPU count must be a positive integer')
+    selected = cluster.get('cpu_ids')
+    if selected is not None:
+        if (not isinstance(selected, list) or len(selected) != count
+                or any(type(cpu) is not int for cpu in selected)
+                or len(set(selected)) != count or not set(selected) <= allowed):
+            raise ValueError('cpu_ids must contain one distinct allowed CPU per advertised core')
+        return selected[:]
+    if count > len(allowed):
+        raise ValueError('Worker CPU count exceeds its allowed CPU affinity')
+    physical, siblings, seen = [], [], set()
+    for cpu in sorted(allowed):
+        topology = Path(f'/sys/devices/system/cpu/cpu{cpu}/topology')
+        try:
+            core = ((topology / 'physical_package_id').read_text().strip(),
+                    (topology / 'core_id').read_text().strip())
+        except OSError:
+            core = ('unknown', str(cpu))
+        if core in seen:
+            siblings.append(cpu)
+        else:
+            seen.add(core)
+            physical.append(cpu)
+    return (physical + siblings)[:count]
 
 
 def tail_output(file, lines: int = 10) -> str:
@@ -31,6 +64,10 @@ def tail_output(file, lines: int = 10) -> str:
 
 
 def run_worker(endpoint: str, cluster: dict, metrics: WorkerMetrics | None = None) -> None:
+    cpus = worker_cpus(cluster)
+    taskset = shutil.which('taskset')
+    if taskset is None:
+        raise RuntimeError('taskset is required to pin worker jobs')
     context = zmq.Context()
     listener = context.socket(zmq.REP)
     listener.bind(f"tcp://*:{int(cluster['network'][1])}")
@@ -42,12 +79,15 @@ def run_worker(endpoint: str, cluster: dict, metrics: WorkerMetrics | None = Non
     poller.register(registration, zmq.POLLIN)
     cluster_id = None
     outputs = {}
+    allocations = {}
     outputs_lock = threading.Lock()
 
-    def execute(job: dict, output) -> None:
+    def execute(job: dict, output, assigned_cpus: list[int]) -> None:
         started_at = time.monotonic()
         try:
-            result = subprocess.run(job["command"], shell=True, stdout=output, stderr=subprocess.STDOUT)
+            result = subprocess.run([taskset, '-c', ','.join(map(str, assigned_cpus)),
+                                     '/bin/sh', '-c', job['command']],
+                                    stdout=output, stderr=subprocess.STDOUT)
         except OSError:
             if metrics:
                 metrics.finished.labels('error').inc()
@@ -55,8 +95,11 @@ def run_worker(endpoint: str, cluster: dict, metrics: WorkerMetrics | None = Non
                 metrics.duration.observe(time.monotonic() - started_at)
             with outputs_lock:
                 outputs.pop((job['cluster_id'], job['job_id']), None)
+                allocations.pop((job['cluster_id'], job['job_id']), None)
                 output.close()
             return
+        with outputs_lock:
+            allocations.pop((job['cluster_id'], job['job_id']), None)
         if metrics:
             metrics.finished.labels('success' if result.returncode == 0 else 'failure').inc()
             metrics.running.dec()
@@ -129,19 +172,31 @@ def run_worker(endpoint: str, cluster: dict, metrics: WorkerMetrics | None = Non
                         and type(job.get("cluster_id")) is int
                         and type(job.get("job_id")) is int
                         and isinstance(job.get("command"), str)
+                        and type(job.get("cores")) is int and job["cores"] > 0
                     )
                 except ValueError:
                     valid = False
                     job = None
                 if valid:
-                    output = tempfile.TemporaryFile()
                     with outputs_lock:
-                        outputs[(job["cluster_id"], job["job_id"])] = output
+                        key = (job['cluster_id'], job['job_id'])
+                        if key in outputs:
+                            listener.send_json({"ok": True})
+                            continue
+                        occupied = {cpu for allocation in allocations.values() for cpu in allocation}
+                        available = [cpu for cpu in cpus if cpu not in occupied]
+                        assigned_cpus = available[:job['cores']]
+                        if len(assigned_cpus) < job['cores']:
+                            listener.send_json({"ok": False, "error": "Not enough available CPUs"})
+                            continue
+                        output = tempfile.TemporaryFile()
+                        outputs[key] = output
+                        allocations[key] = assigned_cpus
                     if metrics:
                         metrics.started.inc()
                         metrics.running.inc()
                     listener.send_json({"ok": True})
-                    threading.Thread(target=execute, args=(job, output), daemon=True).start()
+                    threading.Thread(target=execute, args=(job, output, assigned_cpus), daemon=True).start()
                 else:
                     listener.send_json({"ok": False})
     finally:

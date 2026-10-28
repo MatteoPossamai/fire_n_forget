@@ -41,7 +41,8 @@ def send_job(cluster: Cluster, cluster_id: int, job_id: int, job: Job) -> bool:
     try:
         socket.connect(f"tcp://{cluster.network.ip}:{cluster.network.port}")
         socket.send_json({"action": "schedule", "cluster_id": cluster_id,
-                          "job_id": job_id, "command": job.command})
+                          "job_id": job_id, "command": job.command,
+                          "cores": job.cpu_req.cores if job.cpu_req else 1})
         reply = socket.recv_json()
         return isinstance(reply, dict) and reply.get("ok") is True
     except (zmq.ZMQError, ValueError):

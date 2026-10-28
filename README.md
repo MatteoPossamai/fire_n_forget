@@ -56,7 +56,16 @@ fire-n-forget result 0
 
 Use the `job_id` returned by submission in place of `0`. The worker runs the
 command in its own working directory with its own environment. Resource values
-select a suitable worker; they do not enforce CPU affinity or resource limits.
+select a suitable worker. Each worker pins a job and its child processes to
+the requested number of logical CPUs using `taskset` (required on the worker).
+The worker assigns separate CPUs to concurrent jobs; other processes on the
+machine can still use those CPUs, and jobs can change their own affinity.
+Priority and other resource limits are not changed.
+By default, the worker selects CPUs from its allowed affinity, preferring
+different physical cores before sibling threads. Optionally add `"cpu_ids":
+[0, 1, 2, 3]` to the worker configuration to choose the CPUs explicitly; the
+list must contain one distinct, allowed CPU per advertised core. If there are
+too few allowed CPUs, the worker fails to start instead of oversubscribing.
 The daemon reserves requested CPU cores and RAM while jobs run, so a worker
 can execute multiple jobs at once up to its registered capacity. Jobs without
 CPU requirements reserve one core; specify at least one core when supplying
@@ -132,7 +141,7 @@ are saved in `completed_jobs.json` in the daemon's working directory.
 Submit may include `requirements`, with `cpu` (`cores`, `max_freq`), `gpu`
 (`present`), `ram` (`size`) and `dataset` (`name`, `path`) objects. The daemon
 sends compatible queued jobs to workers with sufficient available resources via their registered
-network address, using `{"action":"schedule","cluster_id":0,"job_id":0,"command":"echo hello"}`;
+network address, using `{"action":"schedule","cluster_id":0,"job_id":0,"command":"echo hello","cores":1}`;
 the worker replies `{"ok":true}`. It executes the command with a shell and
 reports combined standard output and standard error. Start a worker with
 `python -m fire_n_forget.client cluster.json --daemon tcp://127.0.0.1:4015`,
