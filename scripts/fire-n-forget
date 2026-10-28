@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Run the project CLI with its virtual environment, including through a symlink."""
+import os
+from pathlib import Path
+import sys
+
+root = Path(__file__).resolve().parent.parent
+python = root / '.venv' / 'bin' / 'python'
+if not python.is_file():
+    sys.exit(f'Virtual environment not found at {python}; run uv sync in {root}')
+os.execv(str(python), [str(python), '-m', 'fire_n_forget.cli', *sys.argv[1:]])

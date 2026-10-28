@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-fire-n-forget = "fire_n_forget:main"
+fire-n-forget = "fire_n_forget.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]

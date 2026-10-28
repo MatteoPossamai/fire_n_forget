@@ -3,6 +3,23 @@
 Simple distributed task executor on arbitrary
 hardware.
 
+## CLI
+
+Run `scripts/fire-n-forget --help` to see all commands. The script uses the
+project's `.venv` (create it with `uv sync`); it can also be symlinked into a
+directory on `PATH`.
+
+```sh
+scripts/fire-n-forget submit --cores 1 'echo Hi'
+scripts/fire-n-forget submit --cores 1  # prompts for the command
+scripts/fire-n-forget status 0
+scripts/fire-n-forget result 0
+```
+
+Replies are JSON for use in scripts. Set `--daemon tcp://host:4015` before the
+subcommand to connect to a different daemon. `complete` exposes the worker
+completion API; use `complete --help` for its arguments.
+
 ## API
 
 ### Client -> Daemon Server
