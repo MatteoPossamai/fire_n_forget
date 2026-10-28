@@ -1,6 +1,7 @@
 """A worker that receives jobs from the daemon and reports their completion."""
 
 import argparse
+import base64
 import json
 import os
 import subprocess
@@ -78,6 +79,18 @@ def run_worker(endpoint: str, cluster: dict) -> None:
             if listener in events:
                 try:
                     job = listener.recv_json()
+                    if (isinstance(job, dict) and job.get("action") == "stream"
+                        and type(job.get("cluster_id")) is int and type(job.get("job_id")) is int
+                        and type(job.get("offset")) is int and job["offset"] >= 0):
+                        with outputs_lock:
+                            output = outputs.get((job["cluster_id"], job["job_id"]))
+                            if output is None:
+                                reply = {"ok": False, "error": "Job output unavailable"}
+                            else:
+                                data = os.pread(output.fileno(), 65536, job["offset"])
+                                reply = {"ok": True, "data": base64.b64encode(data).decode("ascii")}
+                        listener.send_json(reply)
+                        continue
                     if (isinstance(job, dict) and job.get("action") == "output"
                         and type(job.get("cluster_id")) is int
                         and type(job.get("job_id")) is int):

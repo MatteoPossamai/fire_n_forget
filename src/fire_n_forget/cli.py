@@ -16,6 +16,8 @@ def main() -> int:
         "--daemon", default="tcp://127.0.0.1:4015", help="daemon ZeroMQ endpoint"
     )
     commands = parser.add_subparsers(dest="action", required=True)
+    commands.add_parser("watch", help="open the interactive job monitor")
+    commands.add_parser("jobs", help="list jobs")
     submit = commands.add_parser("submit", help="submit a shell command")
     submit.add_argument(
         "command", nargs="?", help="shell command (prompted for if omitted)"
@@ -46,6 +48,13 @@ def main() -> int:
         "--stdout-file", type=Path, help="read output from a file; defaults to stdin"
     )
     args = parser.parse_args()
+    if args.action == "watch":
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            print("The job monitor requires an interactive terminal", file=sys.stderr)
+            return 1
+        from fire_n_forget.tui import run
+        run(args.daemon)
+        return 0
     request = {"action": args.action}
     try:
         if args.action == "submit":
@@ -71,7 +80,7 @@ def main() -> int:
                 request["requirements"] = requirements
         elif args.action in ("status", "result", "output"):
             request["job_id"] = args.job_id
-        else:
+        elif args.action == "complete":
             request.update(
                 cluster_id=args.cluster_id,
                 job_id=args.job_id,

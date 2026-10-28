@@ -5,16 +5,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def get_completion(path: Path, job_id: int) -> dict | None:
-    """Return the saved completion for a job, if one exists."""
+def list_completions(path: Path) -> list[dict]:
     path = Path(path)
     if not path.exists():
-        return None
+        return []
     with path.open(encoding="utf-8") as file:
         records = json.load(file)
     if not isinstance(records, list):
         raise ValueError(f"Expected a JSON array in {path}")
-    return next((record for record in records if record["job_id"] == job_id), None)
+    return records
+
+
+def get_completion(path: Path, job_id: int) -> dict | None:
+    """Return the saved completion for a job, if one exists."""
+    return next((record for record in list_completions(path) if record["job_id"] == job_id), None)
 
 
 def next_job_id(path: Path) -> int:

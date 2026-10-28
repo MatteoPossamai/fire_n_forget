@@ -1,13 +1,14 @@
 from dataclasses import dataclass, field
 from collections import deque
 import json
+import base64
 import logging
 from pathlib import Path
 import threading
 from typing import Callable
 import zmq
 from fire_n_forget.job import Job, satisfies, JobStatus
-from fire_n_forget.json_utils import get_completion, next_job_id, save_completion
+from fire_n_forget.json_utils import get_completion, list_completions, next_job_id, save_completion
 from fire_n_forget.resource import Cluster, CPUResource, GPUResource, RAMResources, DatasetResource
 from fire_n_forget.notify import notify
 
@@ -46,18 +47,22 @@ def send_job(cluster: Cluster, cluster_id: int, job_id: int, job: Job) -> bool:
         socket.close()
 
 
-def request_output(cluster: Cluster, cluster_id: int, job_id: int) -> dict:
+def request_output(cluster: Cluster, cluster_id: int, job_id: int, offset: int | None = None) -> dict:
     socket = zmq.Context.instance().socket(zmq.REQ)
     socket.setsockopt(zmq.LINGER, 0)
     socket.setsockopt(zmq.SNDTIMEO, 1000)
     socket.setsockopt(zmq.RCVTIMEO, 1000)
     try:
         socket.connect(f"tcp://{cluster.network.ip}:{cluster.network.port}")
-        socket.send_json({"action": "output", "cluster_id": cluster_id, "job_id": job_id})
+        request = {"action": "output" if offset is None else "stream", "cluster_id": cluster_id, "job_id": job_id}
+        if offset is not None:
+            request["offset"] = offset
+        socket.send_json(request)
         reply = socket.recv_json()
-        if not isinstance(reply, dict) or not isinstance(reply.get("stdout"), str):
+        key = "stdout" if offset is None else "data"
+        if not isinstance(reply, dict) or reply.get("ok") is not True or not isinstance(reply.get(key), str):
             return {"ok": False, "error": "Worker output unavailable"}
-        return {"ok": True, "stdout": reply["stdout"]}
+        return {"ok": True, key: reply[key]}
     except (zmq.ZMQError, ValueError):
         return {"ok": False, "error": "Worker output unavailable"}
     finally:
@@ -156,6 +161,13 @@ def handle_message(daemon: Daemon, message: object) -> dict:
     if not isinstance(message, dict):
         raise ValueError("Request must be a JSON object")
     action = message.get("action")
+    if action == "jobs":
+        completed = [{"job_id": r["job_id"], "command": r["command"], "status": "completed"}
+                     for r in list_completions(daemon.completion_file)]
+        active = [{"job_id": job_id, "command": job.command,
+                   "status": "waiting" if cluster_id is None else "running"}
+                  for job_id, (cluster_id, job) in daemon.jobs.items()]
+        return {"ok": True, "jobs": sorted(completed + active, key=lambda job: job["job_id"], reverse=True)}
     if action == "submit":
         command = message.get("command")
         if not isinstance(command, str) or not command.strip():
@@ -194,7 +206,7 @@ def handle_message(daemon: Daemon, message: object) -> dict:
         if type(cluster_id) is not int or cluster_id < 0:
             raise ValueError("cluster_id must be a non-negative integer")
         return {"ok": daemon.deregister(cluster_id)}
-    if action in ("complete", "status", "result", "output"):
+    if action in ("complete", "status", "result", "output", "stream"):
         job_id = message.get("job_id")
         if type(job_id) is not int or job_id < 0:
             raise ValueError("job_id must be a non-negative integer")
@@ -208,15 +220,21 @@ def handle_message(daemon: Daemon, message: object) -> dict:
             return {"ok": daemon.complete(job_id, stdout, cluster_id)}
         if action == "status":
             return {"ok": True, "status": daemon.job_status(job_id).value}
-        if action == "output":
+        if action in ("output", "stream"):
+            offset = message.get("offset", 0) if action == "stream" else None
+            if offset is not None and (type(offset) is not int or offset < 0):
+                raise ValueError("offset must be a non-negative integer")
             if job_id in daemon.jobs:
                 cluster_id, _ = daemon.jobs[job_id]
                 if cluster_id is None:
                     return {"ok": False, "error": "Job is waiting"}
-                return request_output(daemon.pool[cluster_id], cluster_id, job_id)
+                return request_output(daemon.pool[cluster_id], cluster_id, job_id, offset)
             result = daemon.get_completed_job(job_id)
             if result is None:
                 return {"ok": False, "error": "Unknown job"}
+            if offset is not None:
+                data = result["stdout"].encode("utf-8")[offset:offset + 65536]
+                return {"ok": True, "data": base64.b64encode(data).decode("ascii")}
             return {"ok": True, "stdout": "".join(result["stdout"].splitlines(keepends=True)[-10:])}
         return {"ok": True, "result": daemon.get_completed_job(job_id)}
     raise ValueError("Unknown action")

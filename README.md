@@ -15,11 +15,15 @@ scripts/fire-n-forget submit --cores 1  # prompts for the command
 scripts/fire-n-forget status 0
 scripts/fire-n-forget result 0
 scripts/fire-n-forget output 0  # last 10 lines, including while running
+scripts/fire-n-forget jobs
+scripts/fire-n-forget watch
 ```
 
 Replies are JSON for use in scripts. Set `--daemon tcp://host:4015` before the
 subcommand to connect to a different daemon. `complete` exposes the worker
 completion API; use `complete --help` for its arguments.
+In the monitor, use the arrow keys and Enter (or click a row) to open output;
+press Escape to return and `q` to quit. Output refreshes automatically.
 
 ## API
 
@@ -48,6 +52,8 @@ object before accepting the next request.
 | `{"action":"status","job_id":0}` | `{"ok":true,"status":"completed"}` (or `running`, `waiting`, `unknown`) |
 | `{"action":"result","job_id":0}` | `{"ok":true,"result":{...}}`, or `null` if not completed |
 | `{"action":"output","job_id":0}` | `{"ok":true,"stdout":"..."}` with the last 10 lines |
+| `{"action":"jobs"}` | `{"ok":true,"jobs":[...]}` with job IDs, commands and statuses |
+| `{"action":"stream","job_id":0,"offset":0}` | `{"ok":true,"data":"..."}` with up to 65536 output bytes encoded as base64 |
 
 Malformed requests return `{"ok":false,"error":"..."}`. Completed records
 are saved in `completed_jobs.json` in the daemon's working directory.
