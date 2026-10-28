@@ -1,4 +1,5 @@
 """A worker that receives jobs from the daemon and reports their completion."""
+
 import argparse
 import json
 import subprocess
@@ -20,14 +21,20 @@ def run_worker(endpoint: str, cluster: dict) -> None:
     cluster_id = None
 
     def execute(job: dict) -> None:
-        result = subprocess.run(job["command"], shell=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT)
+        result = subprocess.run(
+            job["command"], shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
         socket = context.socket(zmq.REQ)
         socket.connect(endpoint)
         try:
-            socket.send_json({"action": "complete", "cluster_id": job["cluster_id"],
-                              "job_id": job["job_id"],
-                              "stdout": result.stdout.decode("utf-8", errors="replace")})
+            socket.send_json(
+                {
+                    "action": "complete",
+                    "cluster_id": job["cluster_id"],
+                    "job_id": job["job_id"],
+                    "stdout": result.stdout.decode("utf-8", errors="replace"),
+                }
+            )
             socket.recv_json()
         except zmq.ZMQError:
             pass
@@ -39,6 +46,7 @@ def run_worker(endpoint: str, cluster: dict) -> None:
             events = dict(poller.poll())
             if registration in events:
                 reply = registration.recv_json()
+                assert isinstance(reply, dict)
                 if not reply.get("ok"):
                     raise RuntimeError(reply.get("error", "Registration failed"))
                 cluster_id = reply["cluster_id"]
@@ -47,12 +55,16 @@ def run_worker(endpoint: str, cluster: dict) -> None:
             if listener in events:
                 try:
                     job = listener.recv_json()
-                    valid = (isinstance(job, dict) and job.get("action") == "schedule"
-                             and type(job.get("cluster_id")) is int
-                             and type(job.get("job_id")) is int
-                             and isinstance(job.get("command"), str))
+                    valid = (
+                        isinstance(job, dict)
+                        and job.get("action") == "schedule"
+                        and type(job.get("cluster_id")) is int
+                        and type(job.get("job_id")) is int
+                        and isinstance(job.get("command"), str)
+                    )
                 except ValueError:
                     valid = False
+                    job = None
                 listener.send_json({"ok": valid})
                 if valid:
                     threading.Thread(target=execute, args=(job,), daemon=True).start()
@@ -76,7 +88,9 @@ def run_worker(endpoint: str, cluster: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a Fire and Forget worker")
-    parser.add_argument("cluster_json", help="Path to a JSON file describing this worker's resources")
+    parser.add_argument(
+        "cluster_json", help="Path to a JSON file describing this worker's resources"
+    )
     parser.add_argument("--daemon", default="tcp://127.0.0.1:4015")
     args = parser.parse_args()
     with open(args.cluster_json, encoding="utf-8") as file:

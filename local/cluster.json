@@ -1,0 +1,9 @@
+{
+  "network": ["127.0.0.1", 5000],
+  "cpu": [4, 4700],
+  "gpu": [true],
+  "ram": [15],
+  "datasets": [
+    ["speech_commands", "/home/mpossamai/Downloads/speech_commands_v0.02"]
+  ]
+}
