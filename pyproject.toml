@@ -1,0 +1,20 @@
+[project]
+name = "fire-n-forget"
+version = "0.1.0"
+description = "Clustering project for remote task execution"
+readme = "README.md"
+authors = [
+    { name = "Matteo Possamai", email = "mpossamaim@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+  "httpx==0.28.1",
+  "pyzmq==27.2.0",
+]
+
+[project.scripts]
+fire-n-forget = "fire_n_forget:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
