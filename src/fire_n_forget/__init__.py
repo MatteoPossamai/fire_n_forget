@@ -1,2 +1,1 @@
-import src.fire_n_forget.notify
-import src.fire_n_forget.resource
+"""Fire and Forget distributed task executor."""
