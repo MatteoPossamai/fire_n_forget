@@ -46,6 +46,24 @@ def send_job(cluster: Cluster, cluster_id: int, job_id: int, job: Job) -> bool:
         socket.close()
 
 
+def request_output(cluster: Cluster, cluster_id: int, job_id: int) -> dict:
+    socket = zmq.Context.instance().socket(zmq.REQ)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.setsockopt(zmq.SNDTIMEO, 1000)
+    socket.setsockopt(zmq.RCVTIMEO, 1000)
+    try:
+        socket.connect(f"tcp://{cluster.network.ip}:{cluster.network.port}")
+        socket.send_json({"action": "output", "cluster_id": cluster_id, "job_id": job_id})
+        reply = socket.recv_json()
+        if not isinstance(reply, dict) or not isinstance(reply.get("stdout"), str):
+            return {"ok": False, "error": "Worker output unavailable"}
+        return {"ok": True, "stdout": reply["stdout"]}
+    except (zmq.ZMQError, ValueError):
+        return {"ok": False, "error": "Worker output unavailable"}
+    finally:
+        socket.close()
+
+
 @dataclass(slots=True)
 class Daemon:
     pool: dict[int, Cluster] = field(default_factory=dict)
@@ -176,7 +194,7 @@ def handle_message(daemon: Daemon, message: object) -> dict:
         if type(cluster_id) is not int or cluster_id < 0:
             raise ValueError("cluster_id must be a non-negative integer")
         return {"ok": daemon.deregister(cluster_id)}
-    if action in ("complete", "status", "result"):
+    if action in ("complete", "status", "result", "output"):
         job_id = message.get("job_id")
         if type(job_id) is not int or job_id < 0:
             raise ValueError("job_id must be a non-negative integer")
@@ -190,6 +208,16 @@ def handle_message(daemon: Daemon, message: object) -> dict:
             return {"ok": daemon.complete(job_id, stdout, cluster_id)}
         if action == "status":
             return {"ok": True, "status": daemon.job_status(job_id).value}
+        if action == "output":
+            if job_id in daemon.jobs:
+                cluster_id, _ = daemon.jobs[job_id]
+                if cluster_id is None:
+                    return {"ok": False, "error": "Job is waiting"}
+                return request_output(daemon.pool[cluster_id], cluster_id, job_id)
+            result = daemon.get_completed_job(job_id)
+            if result is None:
+                return {"ok": False, "error": "Unknown job"}
+            return {"ok": True, "stdout": "".join(result["stdout"].splitlines(keepends=True)[-10:])}
         return {"ok": True, "result": daemon.get_completed_job(job_id)}
     raise ValueError("Unknown action")
 

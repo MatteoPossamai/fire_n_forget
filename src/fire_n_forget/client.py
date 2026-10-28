@@ -2,10 +2,28 @@
 
 import argparse
 import json
+import os
 import subprocess
+import tempfile
 import threading
 
 import zmq
+
+
+def tail_output(file, lines: int = 10) -> str:
+    """Read the latest lines without changing the subprocess's file position."""
+    end = os.fstat(file.fileno()).st_size
+    offset = end
+    chunks = []
+    newlines = 0
+    while offset > 0 and newlines <= lines:
+        size = min(8192, offset)
+        offset -= size
+        chunk = os.pread(file.fileno(), size, offset)
+        chunks.append(chunk)
+        newlines += chunk.count(b"\n")
+    text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
+    return "".join(text.splitlines(keepends=True)[-lines:])
 
 
 def run_worker(endpoint: str, cluster: dict) -> None:
@@ -19,11 +37,13 @@ def run_worker(endpoint: str, cluster: dict) -> None:
     poller.register(listener, zmq.POLLIN)
     poller.register(registration, zmq.POLLIN)
     cluster_id = None
+    outputs = {}
+    outputs_lock = threading.Lock()
 
-    def execute(job: dict) -> None:
-        result = subprocess.run(
-            job["command"], shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
+    def execute(job: dict, output) -> None:
+        subprocess.run(job["command"], shell=True, stdout=output, stderr=subprocess.STDOUT)
+        output.seek(0)
+        stdout = output.read().decode("utf-8", errors="replace")
         socket = context.socket(zmq.REQ)
         socket.connect(endpoint)
         try:
@@ -32,7 +52,7 @@ def run_worker(endpoint: str, cluster: dict) -> None:
                     "action": "complete",
                     "cluster_id": job["cluster_id"],
                     "job_id": job["job_id"],
-                    "stdout": result.stdout.decode("utf-8", errors="replace"),
+                    "stdout": stdout,
                 }
             )
             socket.recv_json()
@@ -40,6 +60,9 @@ def run_worker(endpoint: str, cluster: dict) -> None:
             pass
         finally:
             socket.close(linger=0)
+            with outputs_lock:
+                outputs.pop((job["cluster_id"], job["job_id"]), None)
+                output.close()
 
     try:
         while True:
@@ -55,6 +78,15 @@ def run_worker(endpoint: str, cluster: dict) -> None:
             if listener in events:
                 try:
                     job = listener.recv_json()
+                    if (isinstance(job, dict) and job.get("action") == "output"
+                        and type(job.get("cluster_id")) is int
+                        and type(job.get("job_id")) is int):
+                        with outputs_lock:
+                            output = outputs.get((job["cluster_id"], job["job_id"]))
+                            reply = ({"ok": True, "stdout": tail_output(output)} if output is not None
+                                     else {"ok": False, "error": "Job output unavailable"})
+                        listener.send_json(reply)
+                        continue
                     valid = (
                         isinstance(job, dict)
                         and job.get("action") == "schedule"
@@ -65,9 +97,14 @@ def run_worker(endpoint: str, cluster: dict) -> None:
                 except ValueError:
                     valid = False
                     job = None
-                listener.send_json({"ok": valid})
                 if valid:
-                    threading.Thread(target=execute, args=(job,), daemon=True).start()
+                    output = tempfile.TemporaryFile()
+                    with outputs_lock:
+                        outputs[(job["cluster_id"], job["job_id"])] = output
+                    listener.send_json({"ok": True})
+                    threading.Thread(target=execute, args=(job, output), daemon=True).start()
+                else:
+                    listener.send_json({"ok": False})
     finally:
         if cluster_id is not None:
             socket = context.socket(zmq.REQ)

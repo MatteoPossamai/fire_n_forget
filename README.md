@@ -14,6 +14,7 @@ scripts/fire-n-forget submit --cores 1 'echo Hi'
 scripts/fire-n-forget submit --cores 1  # prompts for the command
 scripts/fire-n-forget status 0
 scripts/fire-n-forget result 0
+scripts/fire-n-forget output 0  # last 10 lines, including while running
 ```
 
 Replies are JSON for use in scripts. Set `--daemon tcp://host:4015` before the
@@ -46,6 +47,7 @@ object before accepting the next request.
 | `{"action":"complete","cluster_id":0,"job_id":0,"stdout":"output"}` | `{"ok":true}` if assigned to that worker, otherwise `{"ok":false}` |
 | `{"action":"status","job_id":0}` | `{"ok":true,"status":"completed"}` (or `running`, `waiting`, `unknown`) |
 | `{"action":"result","job_id":0}` | `{"ok":true,"result":{...}}`, or `null` if not completed |
+| `{"action":"output","job_id":0}` | `{"ok":true,"stdout":"..."}` with the last 10 lines |
 
 Malformed requests return `{"ok":false,"error":"..."}`. Completed records
 are saved in `completed_jobs.json` in the daemon's working directory.
@@ -58,6 +60,8 @@ the worker replies `{"ok":true}`. It executes the command with a shell and
 reports combined standard output and standard error. Start a worker with
 `python -m fire_n_forget.client cluster.json --daemon tcp://127.0.0.1:4015`,
 where `cluster.json` contains the cluster object from the register example.
+Output is available as the command writes it; programs that buffer output may
+need an unbuffered mode for timely updates.
 
 Queued and running jobs are held in memory and do not survive a daemon restart.
 Jobs wait until a compatible worker is available. Failed dispatches are retried.

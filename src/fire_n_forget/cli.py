@@ -34,7 +34,7 @@ def main() -> int:
         metavar=("NAME", "PATH"),
         help="required dataset name and path",
     )
-    for action in ("status", "result"):
+    for action in ("status", "result", "output"):
         command = commands.add_parser(action, help=f"get job {action}")
         command.add_argument("job_id", type=int)
     complete = commands.add_parser(
@@ -69,7 +69,7 @@ def main() -> int:
                 requirements["dataset"] = dict(zip(("name", "path"), args.dataset))
             if requirements:
                 request["requirements"] = requirements
-        elif args.action in ("status", "result"):
+        elif args.action in ("status", "result", "output"):
             request["job_id"] = args.job_id
         else:
             request.update(
