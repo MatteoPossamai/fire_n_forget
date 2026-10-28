@@ -7,8 +7,11 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 
 import zmq
+from prometheus_client import start_http_server
+from fire_n_forget.metrics import WorkerMetrics
 
 
 def tail_output(file, lines: int = 10) -> str:
@@ -27,7 +30,7 @@ def tail_output(file, lines: int = 10) -> str:
     return "".join(text.splitlines(keepends=True)[-lines:])
 
 
-def run_worker(endpoint: str, cluster: dict) -> None:
+def run_worker(endpoint: str, cluster: dict, metrics: WorkerMetrics | None = None) -> None:
     context = zmq.Context()
     listener = context.socket(zmq.REP)
     listener.bind(f"tcp://*:{int(cluster['network'][1])}")
@@ -42,7 +45,22 @@ def run_worker(endpoint: str, cluster: dict) -> None:
     outputs_lock = threading.Lock()
 
     def execute(job: dict, output) -> None:
-        subprocess.run(job["command"], shell=True, stdout=output, stderr=subprocess.STDOUT)
+        started_at = time.monotonic()
+        try:
+            result = subprocess.run(job["command"], shell=True, stdout=output, stderr=subprocess.STDOUT)
+        except OSError:
+            if metrics:
+                metrics.finished.labels('error').inc()
+                metrics.running.dec()
+                metrics.duration.observe(time.monotonic() - started_at)
+            with outputs_lock:
+                outputs.pop((job['cluster_id'], job['job_id']), None)
+                output.close()
+            return
+        if metrics:
+            metrics.finished.labels('success' if result.returncode == 0 else 'failure').inc()
+            metrics.running.dec()
+            metrics.duration.observe(time.monotonic() - started_at)
         output.seek(0)
         stdout = output.read().decode("utf-8", errors="replace")
         socket = context.socket(zmq.REQ)
@@ -56,9 +74,12 @@ def run_worker(endpoint: str, cluster: dict) -> None:
                     "stdout": stdout,
                 }
             )
-            socket.recv_json()
-        except zmq.ZMQError:
-            pass
+            reply = socket.recv_json()
+            if metrics:
+                metrics.reports.labels('accepted' if isinstance(reply, dict) and reply.get('ok') else 'rejected').inc()
+        except (zmq.ZMQError, ValueError):
+            if metrics:
+                metrics.reports.labels('error').inc()
         finally:
             socket.close(linger=0)
             with outputs_lock:
@@ -74,6 +95,8 @@ def run_worker(endpoint: str, cluster: dict) -> None:
                 if not reply.get("ok"):
                     raise RuntimeError(reply.get("error", "Registration failed"))
                 cluster_id = reply["cluster_id"]
+                if metrics:
+                    metrics.registered.set(1)
                 poller.unregister(registration)
                 registration.close(linger=0)
             if listener in events:
@@ -114,11 +137,16 @@ def run_worker(endpoint: str, cluster: dict) -> None:
                     output = tempfile.TemporaryFile()
                     with outputs_lock:
                         outputs[(job["cluster_id"], job["job_id"])] = output
+                    if metrics:
+                        metrics.started.inc()
+                        metrics.running.inc()
                     listener.send_json({"ok": True})
                     threading.Thread(target=execute, args=(job, output), daemon=True).start()
                 else:
                     listener.send_json({"ok": False})
     finally:
+        if metrics:
+            metrics.registered.set(0)
         if cluster_id is not None:
             socket = context.socket(zmq.REQ)
             socket.setsockopt(zmq.LINGER, 0)
@@ -142,10 +170,18 @@ def main() -> None:
         "cluster_json", help="Path to a JSON file describing this worker's resources"
     )
     parser.add_argument("--daemon", default="tcp://127.0.0.1:4015")
+    parser.add_argument('--metrics-host', default='127.0.0.1')
+    parser.add_argument('--metrics-port', type=int, default=9109)
     args = parser.parse_args()
     with open(args.cluster_json, encoding="utf-8") as file:
         cluster = json.load(file)
-    run_worker(args.daemon, cluster)
+    metrics = WorkerMetrics()
+    http_server, _ = start_http_server(args.metrics_port, addr=args.metrics_host, registry=metrics.registry)
+    try:
+        run_worker(args.daemon, cluster, metrics)
+    finally:
+        http_server.shutdown()
+        http_server.server_close()
 
 
 if __name__ == "__main__":

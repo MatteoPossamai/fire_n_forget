@@ -8,5 +8,5 @@ uv sync
 source "$BASE_DIR/.venv/bin/activate"
 source "$BASE_DIR/.env"
 
-uv run python -m fire_n_forget.daemon &
+uv run python -m fire_n_forget.daemon "$@" &
 echo "Daemon running, PID: $!"

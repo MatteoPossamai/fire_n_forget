@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from collections import deque
+import argparse
 import json
 import base64
 import logging
@@ -7,10 +8,12 @@ from pathlib import Path
 import threading
 from typing import Callable
 import zmq
+from prometheus_client import start_http_server
 from fire_n_forget.job import Job, satisfies, JobStatus
 from fire_n_forget.json_utils import get_completion, list_completions, next_job_id, save_completion
 from fire_n_forget.resource import Cluster, CPUResource, GPUResource, RAMResources, DatasetResource
 from fire_n_forget.notify import notify
+from fire_n_forget.metrics import DaemonMetrics
 
 PORT: int = 0xFAF  # 4015 for the meme
 logger = logging.getLogger(__name__)
@@ -73,21 +76,21 @@ def request_output(cluster: Cluster, cluster_id: int, job_id: int, offset: int |
 class Daemon:
     pool: dict[int, Cluster] = field(default_factory=dict)
     queue: deque[int] = field(default_factory=deque)
-    free_cluster: set = field(default_factory=set)
-    used_cluster: set = field(default_factory=set)
     jobs: dict[int, tuple[int | None, Job]] = field(default_factory=dict)
     _cluster_counter: int = 0
     _run_counter: int = 0
     completion_file: Path = field(default_factory=lambda: Path("completed_jobs.json"))
     sender: Callable[[Cluster, int, int, Job], bool] = send_job
+    metrics: DaemonMetrics | None = None
 
     def __post_init__(self) -> None:
         self._run_counter = max(self._run_counter, next_job_id(self.completion_file))
 
     def register(self, cluster: Cluster) -> int:
         self.pool[self._cluster_counter] = cluster
-        self.free_cluster.add(self._cluster_counter)
         self._cluster_counter += 1
+        if self.metrics:
+            self.metrics.update(self)
         self.dispatch()
         return self._cluster_counter - 1
 
@@ -95,37 +98,58 @@ class Daemon:
         if idx not in self.pool:
             return False
         del self.pool[idx]
-        self.free_cluster.discard(idx)
-        self.used_cluster.discard(idx)
-        for job_id, (cluster_id, job) in self.jobs.items():
+        for job_id, (cluster_id, job) in reversed(list(self.jobs.items())):
             if cluster_id == idx:
                 self.jobs[job_id] = (None, job)
                 self.queue.appendleft(job_id)
+                if self.metrics:
+                    self.metrics.requeued.inc()
+        if self.metrics:
+            self.metrics.update(self)
         self.dispatch()
         return True
 
     def schedule(self, job: Job) -> int:
+        if job.cpu_req is not None and (type(job.cpu_req.cores) is not int or job.cpu_req.cores < 1):
+            raise ValueError("Jobs must request at least one CPU core")
         job_id = self._run_counter
         self._run_counter += 1
         self.jobs[job_id] = (None, job)
         self.queue.append(job_id)
+        if self.metrics:
+            self.metrics.submitted.inc()
+            self.metrics.update(self)
         self.dispatch()
         return job_id
 
     def dispatch(self) -> None:
-        """Try the oldest compatible waiting job on each available worker."""
-        for cluster_id in sorted(self.free_cluster):
-            cluster = self.pool[cluster_id]
-            for job_id in self.queue:
-                _, job = self.jobs[job_id]
-                if not satisfies(cluster, job):
+        """Assign waiting jobs in order wherever enough resources remain."""
+        for job_id in list(self.queue):
+            _, job = self.jobs[job_id]
+            cores = job.cpu_req.cores if job.cpu_req else 1
+            ram = job.ram_res.size if job.ram_res else 0
+            for cluster_id, cluster in sorted(self.pool.items()):
+                running = (running_job for assigned, running_job in self.jobs.values()
+                           if assigned == cluster_id)
+                used_cores = used_ram = 0
+                for running_job in running:
+                    used_cores += running_job.cpu_req.cores if running_job.cpu_req else 1
+                    used_ram += running_job.ram_res.size if running_job.ram_res else 0
+                if (not satisfies(cluster, job) or used_cores + cores > cluster.cpu.cores
+                        or used_ram + ram > cluster.ram.size):
                     continue
-                if self.sender(cluster, cluster_id, job_id, job):
+                if self.metrics:
+                    with self.metrics.dispatch_seconds.time():
+                        sent = self.sender(cluster, cluster_id, job_id, job)
+                    self.metrics.dispatch.labels('accepted' if sent else 'failed').inc()
+                else:
+                    sent = self.sender(cluster, cluster_id, job_id, job)
+                if sent:
                     self.queue.remove(job_id)
                     self.jobs[job_id] = (cluster_id, job)
-                    self.free_cluster.remove(cluster_id)
-                    self.used_cluster.add(cluster_id)
-                break
+                    if self.metrics:
+                        self.metrics.update(self)
+                    break
 
     def complete(self, job_id: int, stdout: str, cluster_id: int | None = None) -> bool:
         if job_id not in self.jobs:
@@ -135,9 +159,9 @@ class Daemon:
             return False
         save_completion(self.completion_file, job_id, job.command, stdout)
         del self.jobs[job_id]
-        if assigned in self.pool:
-            self.used_cluster.discard(assigned)
-            self.free_cluster.add(assigned)
+        if self.metrics:
+            self.metrics.completed.inc()
+            self.metrics.update(self)
         self.dispatch()
         notify_completion(job_id, job.command, stdout)
         return True
@@ -185,7 +209,7 @@ def handle_message(daemon: Daemon, message: object) -> dict:
             raise ValueError("Invalid job requirements") from exc
         if (job.cpu_req is not None and
             (type(job.cpu_req.cores) is not int or type(job.cpu_req.max_freq) is not int or
-             job.cpu_req.cores < 0 or job.cpu_req.max_freq < 0) or
+             job.cpu_req.cores < 1 or job.cpu_req.max_freq < 0) or
             job.gpu_req is not None and type(job.gpu_req.present) is not bool or
             job.ram_res is not None and (type(job.ram_res.size) is not int or job.ram_res.size < 0) or
             job.dataset_res is not None and
@@ -240,12 +264,14 @@ def handle_message(daemon: Daemon, message: object) -> dict:
     raise ValueError("Unknown action")
 
 
-def daemon_main():
-    daemon = Daemon()
+def daemon_main(metrics_host: str = '127.0.0.1', metrics_port: int = 9108):
+    metrics = DaemonMetrics()
+    daemon = Daemon(metrics=metrics)
     context = zmq.Context()
 
     socket = context.socket(zmq.REP)
     socket.bind(f"tcp://*:{PORT}")
+    http_server, _ = start_http_server(metrics_port, addr=metrics_host, registry=metrics.registry)
 
     try:
         while True:
@@ -253,18 +279,30 @@ def daemon_main():
                 daemon.dispatch()
                 continue
             raw_message = socket.recv()
+            action = 'invalid'
             try:
                 message = json.loads(raw_message)
+                if isinstance(message, dict) and message.get('action') in (
+                    'jobs', 'submit', 'register', 'deregister', 'complete', 'status', 'result', 'output', 'stream'
+                ):
+                    action = message['action']
                 reply = handle_message(daemon, message)
             except (ValueError, UnicodeDecodeError) as exc:
                 reply = {"ok": False, "error": str(exc)}
             except OSError:
                 reply = {"ok": False, "error": "Could not access the completion file"}
+            metrics.requests.labels(action, 'success' if reply.get('ok') else 'error').inc()
             socket.send_json(reply)
     finally:
+        http_server.shutdown()
+        http_server.server_close()
         socket.close()
         context.term()
 
 
 if __name__ == "__main__":
-    daemon_main()
+    parser = argparse.ArgumentParser(description="Run the Fire and Forget daemon")
+    parser.add_argument('--metrics-host', default='127.0.0.1')
+    parser.add_argument('--metrics-port', type=int, default=9108)
+    args = parser.parse_args()
+    daemon_main(args.metrics_host, args.metrics_port)

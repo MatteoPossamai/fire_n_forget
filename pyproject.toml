@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
   "httpx==0.28.1",
+  "prometheus-client>=0.26.0",
   "pyzmq==27.2.0",
 ]
 

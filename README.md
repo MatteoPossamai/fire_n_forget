@@ -57,17 +57,51 @@ fire-n-forget result 0
 Use the `job_id` returned by submission in place of `0`. The worker runs the
 command in its own working directory with its own environment. Resource values
 select a suitable worker; they do not enforce CPU affinity or resource limits.
+The daemon reserves requested CPU cores and RAM while jobs run, so a worker
+can execute multiple jobs at once up to its registered capacity. Jobs without
+CPU requirements reserve one core; specify at least one core when supplying
+CPU requirements. GPU availability is checked but GPUs are not reserved.
 The `result` contains the combined stdout and stderr once the command exits.
 Completion means the process ended; its exit code is not recorded, so check
 the output or artifacts to determine whether it succeeded. Telegram delivery
 is best effort. This tool cannot attach to an already-running process.
+
+## Prometheus metrics
+
+The daemon exposes `http://127.0.0.1:9108/metrics` and each worker exposes
+`http://127.0.0.1:9109/metrics`. Counters reset when the process restarts.
+The daemon reports registered workers, waiting and running jobs, total and
+reserved CPU cores and RAM, submissions, completions, requeues, dispatch
+attempts and API requests. Reservations are scheduler accounting, not actual
+CPU or memory use. Worker metrics include running and finished jobs, command
+duration, exit outcome and completion report outcomes. Standard Python and
+process metrics are also exposed; process metrics describe the daemon or worker
+process, not its child jobs. Worker registration indicates the daemon accepted
+registration, not that the connection is currently healthy.
+
+For Prometheus, add these scrape targets (use the actual hostnames when remote):
+
+```yaml
+scrape_configs:
+  - job_name: fire_n_forget_daemon
+    static_configs:
+      - targets: ['127.0.0.1:9108']
+  - job_name: fire_n_forget_worker
+    static_configs:
+      - targets: ['127.0.0.1:9109']
+```
+
+Use `--metrics-host` and `--metrics-port` with either launch script or Python
+module to change the listener. Use a distinct metrics port for each worker on
+the same machine. The default listeners are local-only; exposing them on a
+network makes metrics accessible to anyone who can reach them.
 
 ## API
 
 ### Client -> Daemon Server
 
 - `register`: allows client to register with self-supplied resources, that is then promising to guarantee to the cluster
-- `deregister`: client removes itself. Its running job goes back into the queue.
+- `deregister`: client removes itself. Its running jobs go back into the queue.
 - `complete`: client has finished to execute a job. Sends back results
 
 ### Daemon Server -> Client
@@ -97,7 +131,7 @@ are saved in `completed_jobs.json` in the daemon's working directory.
 
 Submit may include `requirements`, with `cpu` (`cores`, `max_freq`), `gpu`
 (`present`), `ram` (`size`) and `dataset` (`name`, `path`) objects. The daemon
-sends the oldest compatible job to each available worker via its registered
+sends compatible queued jobs to workers with sufficient available resources via their registered
 network address, using `{"action":"schedule","cluster_id":0,"job_id":0,"command":"echo hello"}`;
 the worker replies `{"ok":true}`. It executes the command with a shell and
 reports combined standard output and standard error. Start a worker with
