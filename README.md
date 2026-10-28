@@ -3,6 +3,26 @@
 Simple distributed task executor on arbitrary
 hardware.
 
+## Setup
+
+From the repository directory, run `uv sync` to create `.venv`. Configure
+`TELEGRAM_TOKEN` and `CHAT_ID` as exported variables in `.env` for completion
+notifications. Create a worker configuration as a JSON object in the format
+shown in the register example below; `local/cluster.json` describes this machine.
+
+Start the daemon and then the local worker:
+
+```sh
+scripts/run_daemon.sh
+scripts/run_client.sh
+```
+
+Both scripts start background processes. The daemon listens on port 4015;
+the worker listens on the address and port in its configuration. The worker's
+address must be reachable from the daemon. For this local setup, both use
+`127.0.0.1`. After restarting the daemon, restart the worker too so it
+registers again. Restarting the daemon loses its queued and running job state.
+
 ## CLI
 
 Run `scripts/fire-n-forget --help` to see all commands. The script uses the
@@ -24,6 +44,23 @@ subcommand to connect to a different daemon. `complete` exposes the worker
 completion API; use `complete --help` for its arguments.
 In the monitor, use the arrow keys and Enter (or click a row) to open output;
 press Escape to return and `q` to quit. Output refreshes automatically.
+
+For an automated job, quote the entire shell command and use an absolute path
+for the working directory and any required environment setup:
+
+```sh
+fire-n-forget submit --cores 1 'cd /absolute/project/path && ./run-experiment'
+fire-n-forget status 0
+fire-n-forget result 0
+```
+
+Use the `job_id` returned by submission in place of `0`. The worker runs the
+command in its own working directory with its own environment. Resource values
+select a suitable worker; they do not enforce CPU affinity or resource limits.
+The `result` contains the combined stdout and stderr once the command exits.
+Completion means the process ended; its exit code is not recorded, so check
+the output or artifacts to determine whether it succeeded. Telegram delivery
+is best effort. This tool cannot attach to an already-running process.
 
 ## API
 
